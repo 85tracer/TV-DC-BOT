@@ -37,3 +37,11 @@ def webhook():
  
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
+
+
+@app.route("/tradier-test")
+def tradier_test():
+    return {
+      "token_exists": bool(os.getenv("TRADIER_TOKEN")),
+      "account_exists: bool(os.getenv("TRADIER_ACCOUNT_ID"))
+   }
