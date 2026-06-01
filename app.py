@@ -32,5 +32,22 @@ def tradier_test():
         "tradier_account_exists": bool(TRADIER_ACCOUNT_ID)
     }
  
+@app.route("/tradier-profile")
+def tradier_profile():
+    headers = {
+        "Authorization": f"Bearer {TRADIER_TOKEN}",
+        "Accept": "application/json"
+    }
+ 
+    r = requests.get(
+        https://sandbox.tradier.com/v1/user/profile,
+        headers=headers
+    )
+ 
+    return {
+        "status_code": r.status_code,
+        "response": r.text[:1000]
+    }
+ 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
