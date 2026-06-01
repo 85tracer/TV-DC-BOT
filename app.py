@@ -180,7 +180,12 @@ def webhook():
 
  
 
-        if alert_type == "ENTRY" and side == "CALL" and grade == "A" and entry_type == "EX1":
+        if (
+            alert_type == "ENTRY" 
+            and side == "CALL" 
+            and grade in ["A", "B"] 
+            and entry_type == "EX1"
+        ):
 
             result = place_equity_order(ticker, "buy", 1)
 
