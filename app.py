@@ -40,7 +40,7 @@ def tradier_profile():
     }
  
     r = requests.get(
-        https://sandbox.tradier.com/v1/user/profile,
+        "https://sandbox.tradier.com/v1/user/profile",
         headers=headers
     )
  
