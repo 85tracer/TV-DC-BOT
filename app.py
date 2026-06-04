@@ -133,10 +133,25 @@ def place_option(underlying, option_symbol, side, qty):
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
-        data = request.get_json(force=True)
-    except Exception as e:
-        send_discord(f"❌ JSON ERROR: {str(e)}")
+    data = request.get_json(silent=True)
+ 
+    if data is None:
+        raw = request.get_data(as_text=True)
+ 
+        send_discord(
+            f"❌ NO JSON BODY\n"
+            f"Raw: {raw[:500]}"
+        )
+ 
         return "ok"
+ 
+except Exception as e:
+    send_discord(
+        f"❌ JSON READ ERROR\n{str(e)}"
+    )
+ 
+    return "ok":
+        
  
     ticker = data.get("ticker", "").upper()
     side = data.get("side", "").upper()
