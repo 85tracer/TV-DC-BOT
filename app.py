@@ -252,6 +252,7 @@ def webhook():
         return "ok", 200
  
     ticker = str(data.get("ticker", "")).upper().strip()
+    ticker = ticker.split(":")[-1]
     side = str(data.get("side", "")).upper().strip()
     alert_type = str(data.get("type", "")).upper().strip()
     entry_type = str(data.get("entry_type", "")).strip()
