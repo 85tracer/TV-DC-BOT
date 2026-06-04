@@ -1,14 +1,16 @@
+
 from flask import Flask, request
 import requests
 import os
 import datetime
+import json
  
 app = Flask(__name__)
  
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
 TRADIER_TOKEN = os.getenv("TRADIER_TOKEN")
 TRADIER_ACCOUNT_ID = os.getenv("TRADIER_ACCOUNT_ID")
-TRADIER_BASE_URL = "https://sandbox.tradier.com/v1"
+TRADIER_BASE_URL = https://sandbox.tradier.com/v1
  
 ALLOWED_SYMBOLS = ["SPY", "QQQ", "NVDA", "TSLA"]
  
@@ -108,14 +110,14 @@ def select_option(chain, side, regime):
     return best
  
  
-def place_option(underlying, option_symbol, side, qty):
+def place_option_entry(underlying, option_symbol, qty):
     url = f"{TRADIER_BASE_URL}/accounts/{TRADIER_ACCOUNT_ID}/orders"
  
     payload = {
         "class": "option",
         "symbol": underlying,
         "option_symbol": option_symbol,
-        "side": side,
+        "side": "buy_to_open",
         "quantity": qty,
         "type": "market",
         "duration": "day"
@@ -131,20 +133,122 @@ def place_option(underlying, option_symbol, side, qty):
     return r.status_code, r.text[:1000]
  
  
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    data = None
+def place_option_exit(underlying, option_symbol, qty):
+    url = f"{TRADIER_BASE_URL}/accounts/{TRADIER_ACCOUNT_ID}/orders"
+ 
+    payload = {
+        "class": "option",
+        "symbol": underlying,
+        "option_symbol": option_symbol,
+        "side": "sell_to_close",
+        "quantity": qty,
+        "type": "market",
+        "duration": "day"
+    }
+ 
+    r = requests.post(
+        url,
+        headers=tradier_headers(),
+        data=payload,
+        timeout=10
+    )
+ 
+    return r.status_code, r.text[:1000]
+ 
+ 
+def get_positions():
+    url = f"{TRADIER_BASE_URL}/accounts/{TRADIER_ACCOUNT_ID}/positions"
+ 
+    r = requests.get(
+        url,
+        headers=tradier_headers(),
+        timeout=10
+    )
  
     try:
-        if request.is_json:
-            data = request.get_json(silent=True)
+        body = r.json()
+    except Exception:
+        body = {"raw": r.text[:1000]}
  
-        if data is None:
-            send_discord("❌ Webhook received, but body was not valid JSON.")
-            return "ok", 200
+    return r.status_code, body
+ 
+ 
+def find_option_position(ticker, side):
+    status, body = get_positions()
+ 
+    if status != 200:
+        return None, status, body
+ 
+    positions = body.get("positions", {}).get("position", [])
+ 
+    if positions == "null" or positions is None:
+        positions = []
+ 
+    if not isinstance(positions, list):
+        positions = [positions]
+ 
+    for pos in positions:
+        symbol = str(pos.get("symbol", ""))
+ 
+        if not symbol.startswith(ticker):
+            continue
+ 
+        if side == "CALL" and "C" in symbol:
+            return pos, status, body
+ 
+        if side == "PUT" and "P" in symbol:
+            return pos, status, body
+ 
+    return None, status, body
+ 
+ 
+def parse_webhook_data():
+    try:
+        data = request.get_json(silent=True)
+ 
+        if data is not None:
+            return data
+ 
+        raw = request.get_data(as_text=True).strip()
+ 
+        if not raw:
+            return {"type": "ERROR", "message": "empty body"}
+ 
+        if raw.upper() == "C EXIT":
+            return {
+                "type": "EXIT",
+                "side": "CALL",
+                "ticker": "QQQ"
+            }
+ 
+        if raw.upper() == "P EXIT":
+            return {
+                "type": "EXIT",
+                "side": "PUT",
+                "ticker": "QQQ"
+            }
+ 
+        if raw.startswith("{"):
+            return json.loads(raw)
+ 
+        return {
+            "type": "ERROR",
+            "message": f"unknown raw alert: {raw[:300]}"
+        }
  
     except Exception as e:
-        send_discord(f"❌ JSON READ ERROR\n{str(e)}")
+        return {
+            "type": "ERROR",
+            "message": str(e)
+        }
+ 
+ 
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    data = parse_webhook_data()
+ 
+    if data.get("type") == "ERROR":
+        send_discord(f"❌ WEBHOOK PARSE ERROR\n{data.get('message')}")
         return "ok", 200
  
     ticker = str(data.get("ticker", "")).upper().strip()
@@ -152,6 +256,7 @@ def webhook():
     alert_type = str(data.get("type", "")).upper().strip()
     entry_type = str(data.get("entry_type", "")).strip()
     grade = str(data.get("grade", "")).strip()
+    trade_id = str(data.get("trade_id", "")).strip()
  
     try:
         adx = float(data.get("adx", 22))
@@ -163,6 +268,7 @@ def webhook():
         f"Ticker: {ticker}\n"
         f"Side: {side}\n"
         f"Type: {alert_type}\n"
+        f"Trade ID: {trade_id}\n"
         f"Entry: {entry_type}\n"
         f"Grade: {grade}\n"
         f"ADX: {adx}"
@@ -180,18 +286,62 @@ def webhook():
         send_discord(f"❌ INVALID TYPE: {alert_type}")
         return "ok", 200
  
-    regime = get_regime(adx)
-    qty = size_by_regime(regime)
+    # =========================
+    # EXIT
+    # =========================
  
     if alert_type == "EXIT":
+        position, pos_status, pos_body = find_option_position(ticker, side)
+ 
+        if not position:
+            send_discord(
+                f"⚠️ EXIT RECEIVED BUT NO POSITION FOUND\n"
+                f"Ticker: {ticker}\n"
+                f"Side: {side}\n"
+                f"Positions status: {pos_status}\n"
+                f"Positions response: {str(pos_body)[:700]}"
+            )
+            return "ok", 200
+ 
+        option_symbol = position.get("symbol")
+        qty = abs(int(float(position.get("quantity", 0))))
+ 
+        if qty <= 0:
+            send_discord(
+                f"⚠️ EXIT FOUND POSITION BUT QTY IS ZERO\n"
+                f"Option: {option_symbol}\n"
+                f"Position: {position}"
+            )
+            return "ok", 200
+ 
+        try:
+            status, resp = place_option_exit(
+                underlying=ticker,
+                option_symbol=option_symbol,
+                qty=qty
+            )
+        except Exception as e:
+            send_discord(f"❌ EXIT ORDER REQUEST ERROR\n{str(e)}")
+            return "ok", 200
+ 
         send_discord(
-            f"🔴 EXIT SIGNAL RECEIVED\n"
-            f"Ticker: {ticker}\n"
-            f"Side: {side}\n"
-            f"Note: exit order is not implemented yet."
+            f"🔴 EXIT ORDER SENT\n"
+            f"Underlying: {ticker}\n"
+            f"Option: {option_symbol}\n"
+            f"Side: sell_to_close\n"
+            f"Qty: {qty}\n"
+            f"Status: {status}\n"
+            f"Response: {resp}"
         )
+ 
         return "ok", 200
  
+    # =========================
+    # ENTRY
+    # =========================
+ 
+    regime = get_regime(adx)
+    qty = size_by_regime(regime)
     expiration = datetime.date.today().strftime("%Y-%m-%d")
  
     try:
@@ -206,7 +356,7 @@ def webhook():
             f"Ticker: {ticker}\n"
             f"Expiration: {expiration}\n"
             f"Status: {chain_status}\n"
-            f"Response: {chain}"
+            f"Response: {str(chain)[:800]}"
         )
         return "ok", 200
  
@@ -229,18 +379,17 @@ def webhook():
     delta = contract.get("greeks", {}).get("delta")
  
     try:
-        status, resp = place_option(
+        status, resp = place_option_entry(
             underlying=ticker,
             option_symbol=option_symbol,
-            side="buy_to_open",
             qty=qty
         )
     except Exception as e:
-        send_discord(f"❌ ORDER REQUEST ERROR\n{str(e)}")
+        send_discord(f"❌ ENTRY ORDER REQUEST ERROR\n{str(e)}")
         return "ok", 200
  
     send_discord(
-        f"🚀 ORDER SENT\n"
+        f"🚀 ENTRY ORDER SENT\n"
         f"Underlying: {ticker}\n"
         f"Option: {option_symbol}\n"
         f"Side: buy_to_open\n"
@@ -258,13 +407,13 @@ def webhook():
  
 @app.route("/", methods=["GET"])
 def home():
-    return "v5 running - safer JSON + Tradier timeout", 200
+    return "v6 running - entry + exit enabled", 200
  
  
 @app.route("/test", methods=["GET"])
 def test():
     return {
-        "version": "v5",
+        "version": "v6",
         "discord": bool(DISCORD_WEBHOOK),
         "tradier": bool(TRADIER_TOKEN),
         "account": bool(TRADIER_ACCOUNT_ID)
@@ -273,4 +422,3 @@ def test():
  
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
- 
