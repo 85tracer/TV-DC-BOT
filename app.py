@@ -12,7 +12,7 @@ app = Flask(__name__)
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
 TRADIER_TOKEN = os.getenv("TRADIER_TOKEN")
 TRADIER_ACCOUNT_ID = os.getenv("TRADIER_ACCOUNT_ID")
-TRADIER_BASE_URL = https://sandbox.tradier.com/v1
+TRADIER_BASE_URL = "https://sandbox.tradier.com/v1"
  
 ALLOWED_SYMBOLS = ["SPY", "QQQ", "NVDA", "TSLA"]
  
