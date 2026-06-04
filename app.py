@@ -10,9 +10,12 @@ app = Flask(__name__)
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
 TRADIER_TOKEN = os.getenv("TRADIER_TOKEN")
 TRADIER_ACCOUNT_ID = os.getenv("TRADIER_ACCOUNT_ID")
-TRADIER_BASE_URL = "https://sandbox.tradier.com/v1"
+TRADIER_BASE_URL = https://sandbox.tradier.com/v1
  
 ALLOWED_SYMBOLS = ["SPY", "QQQ", "NVDA", "TSLA"]
+ 
+# In-memory trade map. Railway restart will erase this.
+OPEN_TRADES = {}
  
  
 def send_discord(msg):
@@ -173,6 +176,27 @@ def get_positions():
     return r.status_code, body
  
  
+def find_exact_position(option_symbol):
+    status, body = get_positions()
+ 
+    if status != 200:
+        return None, status, body
+ 
+    positions = body.get("positions", {}).get("position", [])
+ 
+    if positions == "null" or positions is None:
+        positions = []
+ 
+    if not isinstance(positions, list):
+        positions = [positions]
+ 
+    for pos in positions:
+        if str(pos.get("symbol", "")) == option_symbol:
+            return pos, status, body
+ 
+    return None, status, body
+ 
+ 
 def find_option_position(ticker, side):
     status, body = get_positions()
  
@@ -243,6 +267,12 @@ def parse_webhook_data():
         }
  
  
+def make_trade_key(ticker, side, trade_id):
+    if trade_id:
+        return f"{ticker}:{side}:{trade_id}"
+    return f"{ticker}:{side}:LATEST"
+ 
+ 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = parse_webhook_data()
@@ -253,6 +283,7 @@ def webhook():
  
     ticker = str(data.get("ticker", "")).upper().strip()
     ticker = ticker.split(":")[-1]
+ 
     side = str(data.get("side", "")).upper().strip()
     alert_type = str(data.get("type", "")).upper().strip()
     entry_type = str(data.get("entry_type", "")).strip()
@@ -287,11 +318,51 @@ def webhook():
         send_discord(f"❌ INVALID TYPE: {alert_type}")
         return "ok", 200
  
+    trade_key = make_trade_key(ticker, side, trade_id)
+ 
     # =========================
     # EXIT
     # =========================
  
     if alert_type == "EXIT":
+        remembered = OPEN_TRADES.get(trade_key)
+ 
+        if remembered:
+            option_symbol = remembered.get("option_symbol")
+            position, pos_status, pos_body = find_exact_position(option_symbol)
+ 
+            if position:
+                qty = abs(int(float(position.get("quantity", 0))))
+ 
+                status, resp = place_option_exit(
+                    underlying=ticker,
+                    option_symbol=option_symbol,
+                    qty=qty
+                )
+ 
+                send_discord(
+                    f"🔴 EXIT ORDER SENT - EXACT MATCH\n"
+                    f"Trade key: {trade_key}\n"
+                    f"Underlying: {ticker}\n"
+                    f"Option: {option_symbol}\n"
+                    f"Side: sell_to_close\n"
+                    f"Qty: {qty}\n"
+                    f"Status: {status}\n"
+                    f"Response: {resp}"
+                )
+ 
+                if status in [200, 201]:
+                    OPEN_TRADES.pop(trade_key, None)
+ 
+                return "ok", 200
+ 
+            send_discord(
+                f"⚠️ REMEMBERED TRADE NOT FOUND IN POSITIONS\n"
+                f"Trade key: {trade_key}\n"
+                f"Remembered option: {option_symbol}\n"
+                f"Will fallback to side-based search."
+            )
+ 
         position, pos_status, pos_body = find_option_position(ticker, side)
  
         if not position:
@@ -299,6 +370,7 @@ def webhook():
                 f"⚠️ EXIT RECEIVED BUT NO POSITION FOUND\n"
                 f"Ticker: {ticker}\n"
                 f"Side: {side}\n"
+                f"Trade key: {trade_key}\n"
                 f"Positions status: {pos_status}\n"
                 f"Positions response: {str(pos_body)[:700]}"
             )
@@ -315,18 +387,14 @@ def webhook():
             )
             return "ok", 200
  
-        try:
-            status, resp = place_option_exit(
-                underlying=ticker,
-                option_symbol=option_symbol,
-                qty=qty
-            )
-        except Exception as e:
-            send_discord(f"❌ EXIT ORDER REQUEST ERROR\n{str(e)}")
-            return "ok", 200
+        status, resp = place_option_exit(
+            underlying=ticker,
+            option_symbol=option_symbol,
+            qty=qty
+        )
  
         send_discord(
-            f"🔴 EXIT ORDER SENT\n"
+            f"🔴 EXIT ORDER SENT - FALLBACK MATCH\n"
             f"Underlying: {ticker}\n"
             f"Option: {option_symbol}\n"
             f"Side: sell_to_close\n"
@@ -389,8 +457,21 @@ def webhook():
         send_discord(f"❌ ENTRY ORDER REQUEST ERROR\n{str(e)}")
         return "ok", 200
  
+    if status in [200, 201]:
+        OPEN_TRADES[trade_key] = {
+            "ticker": ticker,
+            "side": side,
+            "trade_id": trade_id,
+            "option_symbol": option_symbol,
+            "qty": qty,
+            "entry_type": entry_type,
+            "grade": grade,
+            "created_at": datetime.datetime.utcnow().isoformat()
+        }
+ 
     send_discord(
         f"🚀 ENTRY ORDER SENT\n"
+        f"Trade key: {trade_key}\n"
         f"Underlying: {ticker}\n"
         f"Option: {option_symbol}\n"
         f"Side: buy_to_open\n"
@@ -408,16 +489,17 @@ def webhook():
  
 @app.route("/", methods=["GET"])
 def home():
-    return "v6 running - entry + exit enabled", 200
+    return "v7 running - exact exit memory enabled", 200
  
  
 @app.route("/test", methods=["GET"])
 def test():
     return {
-        "version": "v6",
+        "version": "v7",
         "discord": bool(DISCORD_WEBHOOK),
         "tradier": bool(TRADIER_TOKEN),
-        "account": bool(TRADIER_ACCOUNT_ID)
+        "account": bool(TRADIER_ACCOUNT_ID),
+        "open_trades_count": len(OPEN_TRADES)
     }, 200
  
  
