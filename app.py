@@ -1,3 +1,4 @@
+
 from flask import Flask, request
 import requests
 import os
@@ -13,7 +14,12 @@ TRADIER_BASE_URL = "https://sandbox.tradier.com/v1"
  
 ALLOWED_SYMBOLS = ["SPY", "QQQ", "NVDA", "TSLA"]
  
-# In-memory trade map. Railway restart will erase this.
+MAX_SPREAD_PCT = 0.15
+MIN_VOLUME = 100
+MIN_ABS_DELTA = 0.45
+MAX_ABS_DELTA = 0.65
+TARGET_ABS_DELTA = 0.55
+ 
 OPEN_TRADES = {}
  
  
@@ -66,7 +72,7 @@ def calc_entry_limit_price(bid, ask):
         spread = ask - bid
         mid = (bid + ask) / 2
  
-        if mid > 0 and spread / mid > 0.10:
+        if mid > 0 and spread / mid > MAX_SPREAD_PCT:
             return None
  
         limit_price = min(ask, mid + 0.02)
@@ -108,32 +114,64 @@ def select_option(chain, side, regime):
     if not options:
         return None
  
-    if side == "CALL":
-        target = 0.65 if regime == "STRONG" else 0.50 if regime == "WEAK" else 0.45
-    elif side == "PUT":
-        target = -0.65 if regime == "STRONG" else -0.50 if regime == "WEAK" else -0.45
-    else:
-        return None
- 
-    best = None
-    best_score = 999
+    candidates = []
  
     for opt in options:
         try:
             if opt.get("option_type", "").lower() != side.lower():
                 continue
  
+            bid = float(opt.get("bid") or 0)
+            ask = float(opt.get("ask") or 0)
+            volume = int(float(opt.get("volume") or 0))
             delta = float(opt.get("greeks", {}).get("delta", 0))
-            score = abs(delta - target)
  
-            if score < best_score:
-                best_score = score
-                best = opt
+            if bid <= 0 or ask <= 0:
+                continue
+ 
+            if ask < bid:
+                continue
+ 
+            mid = (bid + ask) / 2
+ 
+            if mid <= 0:
+                continue
+ 
+            spread_pct = (ask - bid) / mid
+            abs_delta = abs(delta)
+ 
+            if volume < MIN_VOLUME:
+                continue
+ 
+            if spread_pct > MAX_SPREAD_PCT:
+                continue
+ 
+            if abs_delta < MIN_ABS_DELTA or abs_delta > MAX_ABS_DELTA:
+                continue
+ 
+            candidates.append({
+                "option": opt,
+                "spread_pct": spread_pct,
+                "volume": volume,
+                "abs_delta": abs_delta,
+                "delta_distance": abs(abs_delta - TARGET_ABS_DELTA)
+            })
  
         except Exception:
             continue
  
-    return best
+    if not candidates:
+        return None
+ 
+    candidates.sort(
+        key=lambda x: (
+            x["spread_pct"],
+            x["delta_distance"],
+            -x["volume"]
+        )
+    )
+ 
+    return candidates[0]["option"]
  
  
 def place_option_entry(underlying, option_symbol, qty, limit_price):
@@ -449,11 +487,12 @@ def webhook():
  
     if not contract:
         send_discord(
-            f" NO CONTRACT FOUND\n"
+            f" NO CONTRACT FOUND AFTER LIQUIDITY FILTER\n"
             f"Ticker: {ticker}\n"
             f"Side: {side}\n"
             f"Expiration: {expiration}\n"
-            f"Regime: {regime}"
+            f"Regime: {regime}\n"
+            f"Rules: volume >= {MIN_VOLUME}, spread <= {int(MAX_SPREAD_PCT * 100)}%, abs(delta) {MIN_ABS_DELTA}-{MAX_ABS_DELTA}"
         )
         return "ok", 200
  
@@ -461,6 +500,7 @@ def webhook():
     bid = contract.get("bid")
     ask = contract.get("ask")
     last = contract.get("last")
+    volume = contract.get("volume")
     delta = contract.get("greeks", {}).get("delta")
  
     limit_price = calc_entry_limit_price(bid, ask)
@@ -474,6 +514,7 @@ def webhook():
             f"Bid: {bid}\n"
             f"Ask: {ask}\n"
             f"Last: {last}\n"
+            f"Volume: {volume}\n"
             f"Delta: {delta}"
         )
         return "ok", 200
@@ -503,7 +544,7 @@ def webhook():
         }
  
     send_discord(
-        f" ENTRY LIMIT ORDER SENT\n"
+        f" ENTRY LIMIT ORDER SENT - LIQUIDITY FILTERED\n"
         f"Trade key: {trade_key}\n"
         f"Underlying: {ticker}\n"
         f"Option: {option_symbol}\n"
@@ -512,6 +553,7 @@ def webhook():
         f"Regime: {regime}\n"
         f"Qty: {qty}\n"
         f"Bid: {bid} Ask: {ask} Last: {last}\n"
+        f"Volume: {volume}\n"
         f"Limit price: {limit_price}\n"
         f"Delta: {delta}\n"
         f"Status: {status}\n"
@@ -523,15 +565,20 @@ def webhook():
  
 @app.route("/", methods=["GET"])
 def home():
-    return "v8 running - entry limit orders enabled", 200
+    return "v9 running - liquidity filtered option selection enabled", 200
  
  
 @app.route("/test", methods=["GET"])
 def test():
     return {
-        "version": "v8",
+        "version": "v9",
         "entry_order_type": "limit",
         "exit_order_type": "market",
+        "max_spread_pct": MAX_SPREAD_PCT,
+        "min_volume": MIN_VOLUME,
+        "min_abs_delta": MIN_ABS_DELTA,
+        "max_abs_delta": MAX_ABS_DELTA,
+        "target_abs_delta": TARGET_ABS_DELTA,
         "discord": bool(DISCORD_WEBHOOK),
         "tradier": bool(TRADIER_TOKEN),
         "account": bool(TRADIER_ACCOUNT_ID),
