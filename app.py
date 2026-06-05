@@ -104,7 +104,6 @@ def get_chain(symbol, expiration):
  
     return r.status_code, body
  
- 
 def select_option(chain, side, regime):
     options = chain.get("options", {}).get("option", [])
  
@@ -129,32 +128,33 @@ def select_option(chain, side, regime):
             if bid <= 0 or ask <= 0:
                 continue
  
-            if ask < bid:
+            if ask <= bid:
                 continue
  
             mid = (bid + ask) / 2
+            spread_pct = (ask - bid) / mid
  
-            if mid <= 0:
+            if volume < 100:
                 continue
  
-            spread_pct = (ask - bid) / mid
+            if spread_pct > 0.15:
+                continue
+ 
             abs_delta = abs(delta)
  
-            if volume < MIN_VOLUME:
+            if abs_delta < 0.45:
                 continue
  
-            if spread_pct > MAX_SPREAD_PCT:
+            if abs_delta > 0.65:
                 continue
  
-            if abs_delta < MIN_ABS_DELTA or abs_delta > MAX_ABS_DELTA:
-                continue
+            delta_distance = abs(abs_delta - 0.55)
  
             candidates.append({
                 "option": opt,
                 "spread_pct": spread_pct,
-                "volume": volume,
-                "abs_delta": abs_delta,
-                "delta_distance": abs(abs_delta - TARGET_ABS_DELTA)
+                "delta_distance": delta_distance,
+                "volume": volume
             })
  
         except Exception:
@@ -172,7 +172,6 @@ def select_option(chain, side, regime):
     )
  
     return candidates[0]["option"]
- 
  
 def place_option_entry(underlying, option_symbol, qty, limit_price):
     url = f"{TRADIER_BASE_URL}/accounts/{TRADIER_ACCOUNT_ID}/orders"
