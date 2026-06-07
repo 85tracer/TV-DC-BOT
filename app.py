@@ -4,13 +4,16 @@ import requests
 import os
 import datetime
 import json
+import time
  
 app = Flask(__name__)
  
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
 TRADIER_TOKEN = os.getenv("TRADIER_TOKEN")
 TRADIER_ACCOUNT_ID = os.getenv("TRADIER_ACCOUNT_ID")
-TRADIER_BASE_URL = "https://sandbox.tradier.com/v1"
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
+ 
+TRADIER_BASE_URL = https://sandbox.tradier.com/v1
  
 ALLOWED_SYMBOLS = ["SPY", "QQQ", "NVDA", "TSLA"]
  
@@ -20,12 +23,18 @@ MIN_ABS_DELTA = 0.45
 MAX_ABS_DELTA = 0.65
 TARGET_ABS_DELTA = 0.55
  
+MAX_PREMIUM_PER_TRADE = 500
+ 
+DUPLICATE_WINDOW_SECONDS = 30
+ 
 OPEN_TRADES = {}
+PROCESSED_ALERTS = {}
  
  
 def send_discord(msg):
     if not DISCORD_WEBHOOK:
         return
+ 
     try:
         requests.post(
             DISCORD_WEBHOOK,
@@ -44,6 +53,28 @@ def tradier_headers():
     }
  
  
+def clean_old_alerts():
+    now = time.time()
+ 
+    old_keys = [
+        key for key, ts in PROCESSED_ALERTS.items()
+        if now - ts > DUPLICATE_WINDOW_SECONDS
+    ]
+ 
+    for key in old_keys:
+        PROCESSED_ALERTS.pop(key, None)
+ 
+ 
+def is_duplicate_alert(alert_key):
+    clean_old_alerts()
+ 
+    if alert_key in PROCESSED_ALERTS:
+        return True
+ 
+    PROCESSED_ALERTS[alert_key] = time.time()
+    return False
+ 
+ 
 def get_regime(adx):
     if adx >= 28:
         return "STRONG"
@@ -58,6 +89,18 @@ def size_by_regime(regime):
     return 1
  
  
+def get_option_cp(option_symbol):
+    s = str(option_symbol).upper()
+ 
+    for i, ch in enumerate(s):
+        if ch in ["C", "P"]:
+            tail = s[i + 1:]
+            if len(tail) >= 8 and tail.isdigit():
+                return ch
+ 
+    return None
+ 
+ 
 def calc_entry_limit_price(bid, ask):
     try:
         bid = float(bid)
@@ -66,13 +109,13 @@ def calc_entry_limit_price(bid, ask):
         if bid <= 0 or ask <= 0:
             return None
  
-        if ask < bid:
+        if ask <= bid:
             return None
  
-        spread = ask - bid
         mid = (bid + ask) / 2
+        spread_pct = (ask - bid) / mid
  
-        if mid > 0 and spread / mid > MAX_SPREAD_PCT:
+        if spread_pct > MAX_SPREAD_PCT:
             return None
  
         limit_price = min(ask, mid + 0.02)
@@ -84,6 +127,7 @@ def calc_entry_limit_price(bid, ask):
  
 def get_chain(symbol, expiration):
     url = f"{TRADIER_BASE_URL}/markets/options/chains"
+ 
     params = {
         "symbol": symbol,
         "expiration": expiration,
@@ -104,6 +148,7 @@ def get_chain(symbol, expiration):
  
     return r.status_code, body
  
+ 
 def select_option(chain, side, regime):
     options = chain.get("options", {}).get("option", [])
  
@@ -113,11 +158,12 @@ def select_option(chain, side, regime):
     if not options:
         return None
  
+    target_type = "call" if side == "CALL" else "put"
     candidates = []
  
     for opt in options:
         try:
-            if opt.get("option_type", "").lower() != side.lower():
+            if opt.get("option_type", "").lower() != target_type:
                 continue
  
             bid = float(opt.get("bid") or 0)
@@ -132,23 +178,27 @@ def select_option(chain, side, regime):
                 continue
  
             mid = (bid + ask) / 2
-            spread_pct = (ask - bid) / mid
  
-            if volume < 100:
+            if mid <= 0:
                 continue
  
-            if spread_pct > 0.15:
+            spread_pct = (ask - bid) / mid
+ 
+            if volume < MIN_VOLUME:
+                continue
+ 
+            if spread_pct > MAX_SPREAD_PCT:
                 continue
  
             abs_delta = abs(delta)
  
-            if abs_delta < 0.45:
+            if abs_delta < MIN_ABS_DELTA:
                 continue
  
-            if abs_delta > 0.65:
+            if abs_delta > MAX_ABS_DELTA:
                 continue
  
-            delta_distance = abs(abs_delta - 0.55)
+            delta_distance = abs(abs_delta - TARGET_ABS_DELTA)
  
             candidates.append({
                 "option": opt,
@@ -172,6 +222,7 @@ def select_option(chain, side, regime):
     )
  
     return candidates[0]["option"]
+ 
  
 def place_option_entry(underlying, option_symbol, qty, limit_price):
     url = f"{TRADIER_BASE_URL}/accounts/{TRADIER_ACCOUNT_ID}/orders"
@@ -237,54 +288,56 @@ def get_positions():
     return r.status_code, body
  
  
+def normalize_positions(body):
+    positions = body.get("positions", {}).get("position", [])
+ 
+    if positions == "null" or positions is None:
+        return []
+ 
+    if not isinstance(positions, list):
+        return [positions]
+ 
+    return positions
+ 
+ 
 def find_exact_position(option_symbol):
     status, body = get_positions()
  
     if status != 200:
         return None, status, body
  
-    positions = body.get("positions", {}).get("position", [])
- 
-    if positions == "null" or positions is None:
-        positions = []
- 
-    if not isinstance(positions, list):
-        positions = [positions]
+    positions = normalize_positions(body)
  
     for pos in positions:
-        if str(pos.get("symbol", "")) == option_symbol:
+        if str(pos.get("symbol", "")) == str(option_symbol):
             return pos, status, body
  
     return None, status, body
  
  
-def find_option_position(ticker, side):
+def find_matching_positions(ticker, side):
     status, body = get_positions()
  
     if status != 200:
-        return None, status, body
+        return [], status, body
  
-    positions = body.get("positions", {}).get("position", [])
+    positions = normalize_positions(body)
+    wanted_cp = "C" if side == "CALL" else "P"
  
-    if positions == "null" or positions is None:
-        positions = []
- 
-    if not isinstance(positions, list):
-        positions = [positions]
+    matches = []
  
     for pos in positions:
-        symbol = str(pos.get("symbol", ""))
+        symbol = str(pos.get("symbol", "")).upper()
  
-        if not symbol.startswith(ticker):
+        if not symbol.startswith(ticker.upper()):
             continue
  
-        if side == "CALL" and "C" in symbol:
-            return pos, status, body
+        actual_cp = get_option_cp(symbol)
  
-        if side == "PUT" and "P" in symbol:
-            return pos, status, body
+        if actual_cp == wanted_cp:
+            matches.append(pos)
  
-    return None, status, body
+    return matches, status, body
  
  
 def parse_webhook_data():
@@ -297,20 +350,9 @@ def parse_webhook_data():
         raw = request.get_data(as_text=True).strip()
  
         if not raw:
-            return {"type": "ERROR", "message": "empty body"}
- 
-        if raw.upper() == "C EXIT":
             return {
-                "type": "EXIT",
-                "side": "CALL",
-                "ticker": "QQQ"
-            }
- 
-        if raw.upper() == "P EXIT":
-            return {
-                "type": "EXIT",
-                "side": "PUT",
-                "ticker": "QQQ"
+                "type": "ERROR",
+                "message": "empty body"
             }
  
         if raw.startswith("{"):
@@ -331,7 +373,12 @@ def parse_webhook_data():
 def make_trade_key(ticker, side, trade_id):
     if trade_id:
         return f"{ticker}:{side}:{trade_id}"
+ 
     return f"{ticker}:{side}:LATEST"
+ 
+ 
+def make_alert_key(ticker, side, trade_id, alert_type):
+    return f"{ticker}:{side}:{trade_id}:{alert_type}"
  
  
 @app.route("/webhook", methods=["POST"])
@@ -339,7 +386,18 @@ def webhook():
     data = parse_webhook_data()
  
     if data.get("type") == "ERROR":
-        send_discord(f" WEBHOOK PARSE ERROR\n{data.get('message')}")
+        send_discord(f"WEBHOOK PARSE ERROR\n{data.get('message')}")
+        return "ok", 200
+ 
+    if WEBHOOK_SECRET:
+        incoming_secret = str(data.get("secret", "")).strip()
+ 
+        if incoming_secret != WEBHOOK_SECRET:
+            send_discord("BLOCKED - BAD WEBHOOK SECRET")
+            return "ok", 200
+ 
+    if not TRADIER_TOKEN or not TRADIER_ACCOUNT_ID:
+        send_discord("BLOCKED - MISSING TRADIER ENVIRONMENT VARIABLES")
         return "ok", 200
  
     ticker = str(data.get("ticker", "")).upper().strip()
@@ -357,7 +415,7 @@ def webhook():
         adx = 22
  
     send_discord(
-        f" ALERT RECEIVED\n"
+        f"ALERT RECEIVED\n"
         f"Ticker: {ticker}\n"
         f"Side: {side}\n"
         f"Type: {alert_type}\n"
@@ -368,15 +426,24 @@ def webhook():
     )
  
     if ticker not in ALLOWED_SYMBOLS:
-        send_discord(f" BLOCKED SYMBOL: {ticker}")
+        send_discord(f"BLOCKED SYMBOL: {ticker}")
         return "ok", 200
  
     if side not in ["CALL", "PUT"]:
-        send_discord(f" INVALID SIDE: {side}")
+        send_discord(f"INVALID SIDE: {side}")
         return "ok", 200
  
     if alert_type not in ["ENTRY", "EXIT"]:
-        send_discord(f" INVALID TYPE: {alert_type}")
+        send_discord(f"INVALID TYPE: {alert_type}")
+        return "ok", 200
+ 
+    alert_key = make_alert_key(ticker, side, trade_id, alert_type)
+ 
+    if is_duplicate_alert(alert_key):
+        send_discord(
+            f"DUPLICATE ALERT BLOCKED\n"
+            f"Alert key: {alert_key}"
+        )
         return "ok", 200
  
     trade_key = make_trade_key(ticker, side, trade_id)
@@ -391,6 +458,15 @@ def webhook():
             if position:
                 qty = abs(int(float(position.get("quantity", 0))))
  
+                if qty <= 0:
+                    send_discord(
+                        f"EXIT BLOCKED - EXACT POSITION QTY ZERO\n"
+                        f"Trade key: {trade_key}\n"
+                        f"Option: {option_symbol}\n"
+                        f"Position: {position}"
+                    )
+                    return "ok", 200
+ 
                 status, resp = place_option_exit(
                     underlying=ticker,
                     option_symbol=option_symbol,
@@ -398,7 +474,7 @@ def webhook():
                 )
  
                 send_discord(
-                    f" EXIT ORDER SENT - EXACT MATCH\n"
+                    f"EXIT ORDER SENT - EXACT MATCH\n"
                     f"Trade key: {trade_key}\n"
                     f"Underlying: {ticker}\n"
                     f"Option: {option_symbol}\n"
@@ -414,17 +490,17 @@ def webhook():
                 return "ok", 200
  
             send_discord(
-                f" REMEMBERED TRADE NOT FOUND IN POSITIONS\n"
+                f"REMEMBERED TRADE NOT FOUND IN POSITIONS\n"
                 f"Trade key: {trade_key}\n"
                 f"Remembered option: {option_symbol}\n"
-                f"Will fallback to side-based search."
+                f"Will try safe fallback search."
             )
  
-        position, pos_status, pos_body = find_option_position(ticker, side)
+        matches, pos_status, pos_body = find_matching_positions(ticker, side)
  
-        if not position:
+        if len(matches) == 0:
             send_discord(
-                f" EXIT RECEIVED BUT NO POSITION FOUND\n"
+                f"EXIT RECEIVED BUT NO POSITION FOUND\n"
                 f"Ticker: {ticker}\n"
                 f"Side: {side}\n"
                 f"Trade key: {trade_key}\n"
@@ -433,12 +509,26 @@ def webhook():
             )
             return "ok", 200
  
+        if len(matches) > 1:
+            match_symbols = [str(pos.get("symbol", "")) for pos in matches]
+ 
+            send_discord(
+                f"EXIT BLOCKED - MULTIPLE MATCHING POSITIONS\n"
+                f"Ticker: {ticker}\n"
+                f"Side: {side}\n"
+                f"Trade key: {trade_key}\n"
+                f"Matches: {match_symbols}\n"
+                f"Manual action required."
+            )
+            return "ok", 200
+ 
+        position = matches[0]
         option_symbol = position.get("symbol")
         qty = abs(int(float(position.get("quantity", 0))))
  
         if qty <= 0:
             send_discord(
-                f" EXIT FOUND POSITION BUT QTY IS ZERO\n"
+                f"EXIT FOUND POSITION BUT QTY IS ZERO\n"
                 f"Option: {option_symbol}\n"
                 f"Position: {position}"
             )
@@ -451,7 +541,7 @@ def webhook():
         )
  
         send_discord(
-            f" EXIT ORDER SENT - FALLBACK MATCH\n"
+            f"EXIT ORDER SENT - FALLBACK SINGLE MATCH\n"
             f"Underlying: {ticker}\n"
             f"Option: {option_symbol}\n"
             f"Side: sell_to_close\n"
@@ -469,12 +559,12 @@ def webhook():
     try:
         chain_status, chain = get_chain(ticker, expiration)
     except Exception as e:
-        send_discord(f" CHAIN REQUEST ERROR\n{str(e)}")
+        send_discord(f"CHAIN REQUEST ERROR\n{str(e)}")
         return "ok", 200
  
     if chain_status != 200:
         send_discord(
-            f" CHAIN ERROR\n"
+            f"CHAIN ERROR\n"
             f"Ticker: {ticker}\n"
             f"Expiration: {expiration}\n"
             f"Status: {chain_status}\n"
@@ -486,12 +576,14 @@ def webhook():
  
     if not contract:
         send_discord(
-            f" NO CONTRACT FOUND AFTER LIQUIDITY FILTER\n"
+            f"NO CONTRACT FOUND AFTER LIQUIDITY FILTER\n"
             f"Ticker: {ticker}\n"
             f"Side: {side}\n"
             f"Expiration: {expiration}\n"
             f"Regime: {regime}\n"
-            f"Rules: volume >= {MIN_VOLUME}, spread <= {int(MAX_SPREAD_PCT * 100)}%, abs(delta) {MIN_ABS_DELTA}-{MAX_ABS_DELTA}"
+            f"Rules: volume >= {MIN_VOLUME}, "
+            f"spread <= {int(MAX_SPREAD_PCT * 100)}%, "
+            f"abs(delta) {MIN_ABS_DELTA}-{MAX_ABS_DELTA}"
         )
         return "ok", 200
  
@@ -506,7 +598,7 @@ def webhook():
  
     if limit_price is None:
         send_discord(
-            f" ENTRY BLOCKED - BAD QUOTE OR WIDE SPREAD\n"
+            f"ENTRY BLOCKED - BAD QUOTE OR WIDE SPREAD\n"
             f"Trade key: {trade_key}\n"
             f"Underlying: {ticker}\n"
             f"Option: {option_symbol}\n"
@@ -518,6 +610,21 @@ def webhook():
         )
         return "ok", 200
  
+    estimated_premium = limit_price * 100 * qty
+ 
+    if estimated_premium > MAX_PREMIUM_PER_TRADE:
+        send_discord(
+            f"ENTRY BLOCKED - PREMIUM TOO HIGH\n"
+            f"Trade key: {trade_key}\n"
+            f"Underlying: {ticker}\n"
+            f"Option: {option_symbol}\n"
+            f"Qty: {qty}\n"
+            f"Limit price: {limit_price}\n"
+            f"Estimated premium: {estimated_premium}\n"
+            f"Max allowed: {MAX_PREMIUM_PER_TRADE}"
+        )
+        return "ok", 200
+ 
     try:
         status, resp = place_option_entry(
             underlying=ticker,
@@ -526,7 +633,7 @@ def webhook():
             limit_price=limit_price
         )
     except Exception as e:
-        send_discord(f" ENTRY ORDER REQUEST ERROR\n{str(e)}")
+        send_discord(f"ENTRY ORDER REQUEST ERROR\n{str(e)}")
         return "ok", 200
  
     if status in [200, 201]:
@@ -543,17 +650,20 @@ def webhook():
         }
  
     send_discord(
-        f" ENTRY LIMIT ORDER SENT - LIQUIDITY FILTERED\n"
+        f"ENTRY LIMIT ORDER SUBMITTED - NOT CONFIRMED FILLED\n"
         f"Trade key: {trade_key}\n"
         f"Underlying: {ticker}\n"
         f"Option: {option_symbol}\n"
         f"Side: buy_to_open\n"
         f"Signal: {side}\n"
+        f"Entry type: {entry_type}\n"
+        f"Grade: {grade}\n"
         f"Regime: {regime}\n"
         f"Qty: {qty}\n"
         f"Bid: {bid} Ask: {ask} Last: {last}\n"
         f"Volume: {volume}\n"
         f"Limit price: {limit_price}\n"
+        f"Estimated premium: {estimated_premium}\n"
         f"Delta: {delta}\n"
         f"Status: {status}\n"
         f"Response: {resp}"
@@ -564,13 +674,13 @@ def webhook():
  
 @app.route("/", methods=["GET"])
 def home():
-    return "v9 running - liquidity filtered option selection enabled", 200
+    return "v10 running - execution safety enabled", 200
  
  
 @app.route("/test", methods=["GET"])
 def test():
     return {
-        "version": "v9",
+        "version": "v10",
         "entry_order_type": "limit",
         "exit_order_type": "market",
         "max_spread_pct": MAX_SPREAD_PCT,
@@ -578,10 +688,14 @@ def test():
         "min_abs_delta": MIN_ABS_DELTA,
         "max_abs_delta": MAX_ABS_DELTA,
         "target_abs_delta": TARGET_ABS_DELTA,
+        "max_premium_per_trade": MAX_PREMIUM_PER_TRADE,
+        "duplicate_window_seconds": DUPLICATE_WINDOW_SECONDS,
         "discord": bool(DISCORD_WEBHOOK),
         "tradier": bool(TRADIER_TOKEN),
         "account": bool(TRADIER_ACCOUNT_ID),
-        "open_trades_count": len(OPEN_TRADES)
+        "webhook_secret_enabled": bool(WEBHOOK_SECRET),
+        "open_trades_count": len(OPEN_TRADES),
+        "processed_alerts_count": len(PROCESSED_ALERTS)
     }, 200
  
  
